@@ -42,6 +42,7 @@ import type {
   BranchMetricsAggregate,
   ConversationMetricsAggregate,
   ConversationSummary,
+  LanguageMetricsAggregate,
   ModelPrices,
   TokenBucketKey,
   TokenBuckets,
@@ -141,7 +142,7 @@ interface KpiCardProps {
 }
 
 interface PanelHeaderProps {
-  title: string;
+  title: React.ReactNode;
   infoTooltip?: string;
   meta?: React.ReactNode;
 }
@@ -157,6 +158,47 @@ const WORKSPACE_GRID = 'minmax(96px, 1fr) minmax(56px, 110px) 52px 52px 56px';
 const BRANCH_GRID = 'minmax(80px, 1fr) 64px minmax(48px, 100px) 48px 48px 52px';
 const MERGE_STATUS_GRID = 'minmax(72px, 1fr) minmax(56px, 110px) 52px 52px 56px';
 const SHARE_FILL = 'var(--brand-orange)';
+// One grid for the header and every row. The last two tracks size to the
+// column labels; separate per-row grids drift apart.
+const LANGUAGE_MIX_COLUMNS = 'minmax(112px, 180px) minmax(72px, 1fr) max-content max-content';
+const LANGUAGE_MIX_LIMIT = 8;
+const LANGUAGE_MIX_TOOLTIP =
+  "Session share counts sessions that touched the language. Allocated cost splits each session's estimate across the distinct files its tool calls named.";
+const LANGUAGE_COLORS: Record<string, string> = {
+  configuration: '#A78BFA',
+  documentation: '#94A3B8',
+  typescript: '#5794F2',
+  javascript: '#F0DB4F',
+  python: '#E0B400',
+  java: '#E06C3A',
+  shell: '#C4B5FD',
+  go: '#2DD4BF',
+  css: '#C084FC',
+  html: '#E34F26',
+  rust: '#DEA584',
+  ruby: '#CC342D',
+  kotlin: '#7F52FF',
+  swift: '#F05138',
+  php: '#8892BF',
+  c: '#9CA3AF',
+  cpp: '#6B8EC7',
+  csharp: '#9B4F96',
+  sql: '#6B7280',
+};
+const LANGUAGE_MARKS: Record<string, string> = {
+  typescript: 'TS',
+  javascript: 'JS',
+  python: 'Py',
+  java: 'Jv',
+  go: 'Go',
+  shell: 'Sh',
+  css: '#',
+  rust: 'Rs',
+  ruby: 'Rb',
+  php: 'Ph',
+  html: '<>',
+  sql: 'Q',
+};
 const MERGE_STATUS_TOOLTIP =
   "Compared with each workspace's current git default branch using local refs from the last fetch. Run git fetch in the workspace to refresh.";
 const MODEL_GRID = 'minmax(72px, 1fr) 70px 68px 56px';
@@ -1091,6 +1133,304 @@ export function AnalyticsChart({
           </div>
         </div>
       )}
+    </SurfaceCard>
+  );
+}
+
+function languageMixAvailable(aggregate: ConversationMetricsAggregate | null): boolean {
+  return (
+    aggregate != null &&
+    (aggregate.language_rows != null || aggregate.language_shared != null || aggregate.language_sessions != null)
+  );
+}
+
+function sessionShare(touched: number, total: number): { label: string; width: number } {
+  if (total <= 0 || touched <= 0) return { label: '0%', width: 0 };
+  const exact = (touched / total) * 100;
+  if (exact > 0 && exact < 0.5) return { label: '<1%', width: 1.5 };
+  return { label: `${Math.round(exact)}%`, width: Math.round(exact) };
+}
+
+function languageInk(id: string): string {
+  if (id === 'python' || id === 'javascript' || id === 'go' || id === 'shell') return '#1A1A1A';
+  return '#fff';
+}
+
+function LanguageGlyph({ id }: { id: string }) {
+  if (id === 'configuration' || id === 'documentation') return null;
+  const color = LANGUAGE_COLORS[id] || 'var(--fg3)';
+  const mark = LANGUAGE_MARKS[id];
+  if (!mark) {
+    return (
+      <span aria-hidden="true" style={{ width: 14, height: 14, borderRadius: 3, background: color, flexShrink: 0 }} />
+    );
+  }
+  return (
+    <svg width={14} height={14} viewBox="0 0 14 14" aria-hidden="true" style={{ flexShrink: 0, display: 'block' }}>
+      <rect width="14" height="14" rx="3" fill={color} />
+      <text
+        x="7"
+        y="10"
+        textAnchor="middle"
+        fontSize="6.5"
+        fontWeight="700"
+        fill={languageInk(id)}
+        fontFamily="var(--fontFamilyMonospace)"
+      >
+        {mark}
+      </text>
+    </svg>
+  );
+}
+
+function languageMeasure(
+  row: LanguageMetricsAggregate,
+  unit: AnalyticsUnit,
+  prices: ModelPrices | null,
+): { text: string; title: string } {
+  const tokens = tokenTotal(row.token_buckets);
+  if (unit === 'tokens') {
+    return { text: formatTokens(tokens), title: 'Allocated tokens' };
+  }
+  if (tokens <= 0) return { text: formatCost(0), title: ESTIMATED_COST_TOOLTIP };
+  const estimate = conversationCostEstimateByModel(row, prices);
+  return { text: formatCostEstimate(estimate), title: costEstimateTitle(estimate) };
+}
+
+function LanguageMixPanel({
+  aggregate,
+  unit,
+  prices,
+  empty,
+  sessionCount,
+}: {
+  aggregate: ConversationMetricsAggregate | null;
+  unit: AnalyticsUnit;
+  prices: ModelPrices | null;
+  empty: React.ReactNode;
+  sessionCount: number;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const [sharedOpen, setSharedOpen] = useState(false);
+  const known = languageMixAvailable(aggregate);
+  const rows = aggregate?.language_rows ?? [];
+  const shared = aggregate?.language_shared;
+  const sessions = aggregate?.language_sessions ?? 0;
+  const visible = showAll ? rows : rows.slice(0, LANGUAGE_MIX_LIMIT);
+  const hidden = Math.max(0, rows.length - visible.length);
+  const measureLabel = unit === 'cost' ? 'Cost' : 'Tokens';
+  const sharedMeasure = shared ? languageMeasure(shared, unit, prices) : null;
+  const showRows = known && sessions > 0;
+  const columnLabel: React.CSSProperties = {
+    margin: 0,
+    padding: '12px 0',
+    textAlign: 'right',
+    whiteSpace: 'nowrap',
+    color: 'var(--fg3)',
+  };
+  const figure: React.CSSProperties = {
+    margin: '9px 0',
+    textAlign: 'right',
+    whiteSpace: 'nowrap',
+    fontVariantNumeric: 'tabular-nums',
+  };
+  return (
+    <SurfaceCard style={{ boxShadow: 'none', minWidth: 0 }} data-testid="language-mix">
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: LANGUAGE_MIX_COLUMNS,
+          columnGap: 12,
+          alignItems: 'center',
+          minWidth: 0,
+          padding: '0 18px 14px',
+          fontFamily: 'var(--fontFamilyMonospace)',
+          fontSize: 11,
+        }}
+      >
+        <span
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 5,
+            margin: 0,
+            padding: '12px 0',
+            fontFamily: 'var(--fontFamily)',
+            fontSize: 13,
+            fontWeight: 600,
+            color: 'var(--fg-max)',
+          }}
+        >
+          <Icon name="code" size={14} />
+          Language mix
+          <span title={LANGUAGE_MIX_TOOLTIP} style={{ display: 'inline-flex', color: 'var(--fg3)' }}>
+            <Icon name="info" size={12} />
+          </span>
+        </span>
+        <span style={columnLabel} />
+        <span style={columnLabel}>Share</span>
+        <span style={columnLabel}>{measureLabel}</span>
+        <div
+          style={{
+            gridColumn: '1 / -1',
+            height: 6,
+            margin: '0 -18px',
+            borderTop: '1px solid var(--border-weak)',
+          }}
+        />
+        {!showRows ? (
+          <div style={{ gridColumn: '1 / -1', margin: '0 -18px', fontFamily: 'var(--fontFamily)' }}>
+            <EmptyPanel>{!known || sessionCount === 0 ? empty : 'No recognized files in this range.'}</EmptyPanel>
+          </div>
+        ) : (
+          <>
+            {rows.length === 0 && (
+              <div
+                style={{
+                  gridColumn: '1 / -1',
+                  padding: '10px 0 4px',
+                  color: 'var(--fg2)',
+                  fontFamily: 'var(--fontFamily)',
+                  fontSize: 12,
+                }}
+              >
+                No recognized files in this range.
+              </div>
+            )}
+            {visible.map((row) => {
+              const share = sessionShare(row.sessions, sessions);
+              const measure = languageMeasure(row, unit, prices);
+              const color = LANGUAGE_COLORS[row.id] || 'var(--fg3)';
+              const rowTitle = `${formatInteger(row.sessions)} of ${formatInteger(sessions)} sessions · ${formatInteger(row.files)} ${row.files === 1 ? 'file' : 'files'}`;
+              return (
+                <div key={row.id} data-language-row={row.id} title={rowTitle} style={{ display: 'contents' }}>
+                  <span
+                    title={rowTitle}
+                    style={{
+                      minWidth: 0,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      margin: '9px 0',
+                      color: 'var(--fg-max)',
+                      fontFamily: 'var(--fontFamily)',
+                      fontSize: 13,
+                      fontWeight: 600,
+                    }}
+                  >
+                    <LanguageGlyph id={row.id} />
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {row.name}
+                    </span>
+                  </span>
+                  <span
+                    title={rowTitle}
+                    style={{
+                      height: 8,
+                      margin: '9px 0',
+                      borderRadius: 4,
+                      overflow: 'hidden',
+                      background: 'var(--bar-track)',
+                    }}
+                  >
+                    <span
+                      data-language-share={share.label}
+                      style={{
+                        display: 'block',
+                        width: `${Math.max(0, Math.min(100, share.width))}%`,
+                        height: '100%',
+                        borderRadius: 4,
+                        background: color,
+                      }}
+                    />
+                  </span>
+                  <span title={rowTitle} style={{ ...figure, color: 'var(--fg1)', fontSize: 12 }}>
+                    {share.label}
+                  </span>
+                  <span title={measure.title} style={{ ...figure, color: 'var(--fg-max)', fontSize: 12.5 }}>
+                    {measure.text}
+                  </span>
+                </div>
+              );
+            })}
+            {hidden > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowAll(true)}
+                style={{
+                  gridColumn: '1 / -1',
+                  justifySelf: 'start',
+                  marginTop: 4,
+                  padding: 0,
+                  border: 'none',
+                  background: 'transparent',
+                  color: 'var(--fg2)',
+                  cursor: 'pointer',
+                  fontFamily: 'var(--fontFamily)',
+                  fontSize: 12,
+                }}
+              >
+                Show {formatInteger(hidden)} more
+              </button>
+            )}
+            {shared && sharedMeasure && (
+              <>
+                <button
+                  type="button"
+                  aria-expanded={sharedOpen}
+                  onClick={() => setSharedOpen((open) => !open)}
+                  style={{
+                    gridColumn: '1 / -1',
+                    display: 'grid',
+                    gridTemplateColumns: 'subgrid',
+                    alignItems: 'center',
+                    marginTop: 8,
+                    padding: '10px 0 2px',
+                    border: 'none',
+                    borderTop: '1px solid var(--border-weak)',
+                    background: 'transparent',
+                    color: 'inherit',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    font: 'inherit',
+                  }}
+                >
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <Icon name={sharedOpen ? 'chevron' : 'cright'} size={12} />
+                    <span style={{ color: 'var(--fg1)', fontFamily: 'var(--fontFamily)', fontSize: 12.5 }}>
+                      {shared.name || 'Shared / unlinked'}
+                    </span>
+                  </span>
+                  <span />
+                  <span />
+                  <span
+                    data-language-shared={sharedMeasure.text}
+                    title={sharedMeasure.title}
+                    style={{ ...figure, margin: 0, color: 'var(--fg1)', fontSize: 12.5 }}
+                  >
+                    {sharedMeasure.text}
+                  </span>
+                </button>
+                {sharedOpen && (
+                  <div
+                    style={{
+                      gridColumn: '1 / -1',
+                      padding: '4px 0 2px 20px',
+                      color: 'var(--fg3)',
+                      fontFamily: 'var(--fontFamily)',
+                      fontSize: 12,
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    Sessions with no recognized file land here in full. Sessions that also touched unrecognized paths
+                    contribute that share.
+                  </div>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </div>
     </SurfaceCard>
   );
 }
@@ -2091,8 +2431,10 @@ function HeaviestSessionsPanel({
             {' '}
             Session distribution is based on {formatInteger(returnedCurrentRange)} of{' '}
             {formatInteger(totalConversations ?? rangeSessions)} sessions in range.{' '}
-            {kpisCoverAll ? 'KPI totals, model totals, token charts, and trends' : 'Token charts and trends'} cover all
-            generations in range.
+            {kpisCoverAll
+              ? 'KPI totals, model totals, language mix, token charts, and trends'
+              : 'Token charts and trends'}{' '}
+            cover all generations in range.
           </Fragment>
         )}
         {previousCoverage && !previousKpisCoverAll && (
@@ -2497,6 +2839,16 @@ function AnalyticsContent(props: ResolvedAnalyticsViewProps) {
         onOpen={props.onOpenConversation}
         empty={empty}
       />
+
+      <div style={{ marginTop: 12 }}>
+        <LanguageMixPanel
+          aggregate={props.aggregate ?? null}
+          unit={props.unit}
+          prices={prices}
+          empty={empty}
+          sessionCount={currentSessionCount}
+        />
+      </div>
 
       <div
         style={{
